@@ -169,6 +169,8 @@ export function mount_underwater(
   const ripple_texture = gl.createTexture();
   const vertices = gl.createBuffer();
   const texture = gl.createTexture();
+  const lifecycle = new AbortController();
+  const { signal } = lifecycle;
   const motion = matchMedia("(prefers-reduced-motion: reduce)");
   let observer: ResizeObserver | undefined;
   let frame = 0;
@@ -221,18 +223,11 @@ export function mount_underwater(
   }
 
   function cleanup() {
+    if (signal.aborted) return;
+    lifecycle.abort();
     cancelAnimationFrame(frame);
     observer?.disconnect();
-    motion.removeEventListener("change", update_motion);
-    window.removeEventListener("pointermove", move_pointer);
-    window.removeEventListener("pointerdown", start_pointer);
-    window.removeEventListener("pointerup", end_pointer);
-    window.removeEventListener("pointercancel", end_pointer);
-    window.removeEventListener("blur", reset_drag);
-    canvas.removeEventListener("webglcontextlost", fallback);
     canvas.style.opacity = "0";
-    image.removeEventListener("load", upload_image);
-    image.removeEventListener("error", fallback);
     gl.deleteTexture(texture);
     gl.deleteTexture(ripple_texture);
     gl.deleteBuffer(vertices);
@@ -293,13 +288,17 @@ export function mount_underwater(
   const has_ripples_uniform = gl.getUniformLocation(program, "u_has_ripples");
   gl.uniform1i(gl.getUniformLocation(program, "u_ripple_field"), 1);
 
-  gl.activeTexture(gl.TEXTURE1);
-  gl.bindTexture(gl.TEXTURE_2D, ripple_texture);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.activeTexture(gl.TEXTURE0);
+  function configure_texture(unit: number, target: WebGLTexture) {
+    gl.activeTexture(unit);
+    gl.bindTexture(gl.TEXTURE_2D, target);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+
+  configure_texture(gl.TEXTURE1, ripple_texture);
+  configure_texture(gl.TEXTURE0, texture);
 
   function draw(time: number, now = performance.now()) {
     const has_ripples = water?.update(now) ?? false;
@@ -325,11 +324,6 @@ export function mount_underwater(
   }
 
   function upload_image() {
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, image);
     if (gl.getError() !== gl.NO_ERROR) {
       fallback();
@@ -337,53 +331,55 @@ export function mount_underwater(
     }
 
     gl.uniform2f(image_size_uniform, image.naturalWidth, image.naturalHeight);
-    observer = new ResizeObserver(() => {
-      const scale = Math.min(devicePixelRatio, 1.5);
-      const width = Math.max(1, Math.round(canvas.clientWidth * scale));
-      const height = Math.max(1, Math.round(canvas.clientHeight * scale));
-      if (ready && canvas.width === width && canvas.height === height) return;
-      canvas.width = width;
-      canvas.height = height;
-      water = create_water_surface(width, height);
-      gl.activeTexture(gl.TEXTURE1);
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        gl.RGBA,
-        water.width,
-        water.height,
-        0,
-        gl.RGBA,
-        gl.UNSIGNED_BYTE,
-        water.pixels,
-      );
-      gl.activeTexture(gl.TEXTURE0);
-      gl.viewport(0, 0, width, height);
-      gl.uniform2f(viewport_uniform, width, height);
-      draw(motion.matches ? 0 : (performance.now() - start) / 1000);
-      canvas.style.opacity = "1";
-      if (!ready) {
-        ready = true;
-        on_status("ready");
-        if (!motion.matches) frame = requestAnimationFrame(animate);
-      }
-    });
+    observer = new ResizeObserver(resize);
     observer.observe(canvas);
-    motion.addEventListener("change", update_motion);
-    window.addEventListener("pointermove", move_pointer, { passive: true });
-    window.addEventListener("pointerdown", start_pointer, { passive: true });
-    window.addEventListener("pointerup", end_pointer);
-    window.addEventListener("pointercancel", end_pointer);
-    window.addEventListener("blur", reset_drag);
+    motion.addEventListener("change", update_motion, { signal });
+    window.addEventListener("pointermove", move_pointer, { passive: true, signal });
+    window.addEventListener("pointerdown", start_pointer, { passive: true, signal });
+    window.addEventListener("pointerup", end_pointer, { signal });
+    window.addEventListener("pointercancel", end_pointer, { signal });
+    window.addEventListener("blur", reset_drag, { signal });
   }
 
-  canvas.addEventListener("webglcontextlost", fallback);
+  function resize() {
+    const scale = Math.min(devicePixelRatio, 1.5);
+    const width = Math.max(1, Math.round(canvas.clientWidth * scale));
+    const height = Math.max(1, Math.round(canvas.clientHeight * scale));
+    if (ready && canvas.width === width && canvas.height === height) return;
+    canvas.width = width;
+    canvas.height = height;
+    water = create_water_surface(width, height);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA,
+      water.width,
+      water.height,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      water.pixels,
+    );
+    gl.activeTexture(gl.TEXTURE0);
+    gl.viewport(0, 0, width, height);
+    gl.uniform2f(viewport_uniform, width, height);
+    draw(motion.matches ? 0 : (performance.now() - start) / 1000);
+    canvas.style.opacity = "1";
+    if (!ready) {
+      ready = true;
+      on_status("ready");
+      if (!motion.matches) frame = requestAnimationFrame(animate);
+    }
+  }
+
+  canvas.addEventListener("webglcontextlost", fallback, { signal });
   if (image.complete) {
     if (image.naturalWidth) upload_image();
     else fallback();
   } else {
-    image.addEventListener("load", upload_image, { once: true });
-    image.addEventListener("error", fallback, { once: true });
+    image.addEventListener("load", upload_image, { once: true, signal });
+    image.addEventListener("error", fallback, { once: true, signal });
   }
   return cleanup;
 }
