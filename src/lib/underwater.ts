@@ -1,4 +1,4 @@
-const ripple_duration = 1.55;
+import { create_water_surface } from "./water_surface.js";
 
 const vertex_source = `
 attribute vec2 a_position;
@@ -19,8 +19,8 @@ uniform sampler2D u_image;
 uniform vec2 u_resolution;
 uniform vec2 u_image_size;
 uniform float u_time;
-uniform vec3 u_pointer;
 uniform sampler2D u_ripple_field;
+uniform bool u_has_ripples;
 
 float random_value(vec2 cell) {
   vec3 p = fract(cell.xyx * 0.1031);
@@ -99,15 +99,14 @@ void main() {
     noise(flow + vec2(7.2, -u_time * 0.17))
   ) - 0.5;
   vec2 aspect = vec2(screen_aspect, 1.0);
-  vec2 pointer_offset = (uv - u_pointer.xy) * aspect;
-  float pointer_distance = length(pointer_offset);
-  float wake = u_pointer.z * (1.0 - smoothstep(0.0, 0.19, pointer_distance));
-  vec2 disturbance = pointer_offset * wake
-    * sin(pointer_distance * 54.0 - u_time * 6.0) * 0.18;
-  vec4 ripple_field = texture2D(u_ripple_field, screen);
-  vec2 ripple_offset = (ripple_field.xy - ripple_field.zw) * 0.052;
-  disturbance += ripple_offset;
-  float ripple_light = length(ripple_offset) * 8.0;
+  vec2 disturbance = vec2(0.0);
+  float ripple_light = 0.0;
+  if (u_has_ripples) {
+    vec2 slope = texture2D(u_ripple_field, uv).rg - vec2(128.0 / 255.0);
+    vec2 ripple_offset = slope * 0.058;
+    disturbance = ripple_offset;
+    ripple_light = length(ripple_offset) * 5.1;
+  }
 
   vec2 displacement = warp * 0.019 + disturbance / aspect;
   vec3 image = texture2D(u_image, (uv - 0.5 + displacement) * cover + 0.5).rgb;
@@ -140,28 +139,6 @@ void main() {
 }
 `;
 
-const ripple_source = `
-precision mediump float;
-
-uniform vec2 u_field_size;
-uniform vec3 u_ripple;
-
-void main() {
-  vec2 offset = vec2(gl_FragCoord.x, u_field_size.y - gl_FragCoord.y)
-    / u_field_size.y - u_ripple.xy;
-  float distance_to_center = length(offset);
-  float age = u_ripple.z;
-  float crest = distance_to_center - age * 0.36;
-  float band = 1.0 - smoothstep(0.0, 0.065, abs(crest));
-  float fade = (1.0 - smoothstep(0.16, ${ripple_duration}, age))
-    * smoothstep(0.0, 0.09, age);
-  vec2 wave = offset / max(0.018, distance_to_center) * sin(crest * 95.0) * band * fade * 0.25;
-
-  // Store positive and negative offsets separately for additive blending.
-  gl_FragColor = vec4(max(wave, 0.0), max(-wave, 0.0));
-}
-`;
-
 function compile_shader(gl: WebGLRenderingContext, type: number, source: string) {
   const shader = gl.createShader(type);
   if (!shader) return null;
@@ -188,27 +165,21 @@ export function mount_underwater(
 
   const vertex = compile_shader(gl, gl.VERTEX_SHADER, vertex_source);
   const fragment = compile_shader(gl, gl.FRAGMENT_SHADER, fragment_source);
-  const ripple_fragment = compile_shader(gl, gl.FRAGMENT_SHADER, ripple_source);
   const program = gl.createProgram();
-  const ripple_program = gl.createProgram();
   const ripple_texture = gl.createTexture();
-  const ripple_framebuffer = gl.createFramebuffer();
   const vertices = gl.createBuffer();
   const texture = gl.createTexture();
+  const lifecycle = new AbortController();
+  const { signal } = lifecycle;
   const motion = matchMedia("(prefers-reduced-motion: reduce)");
   let observer: ResizeObserver | undefined;
   let frame = 0;
   let ready = false;
 
-  const pointer = { x: 0, y: 0, strength: 0 };
-  const pointer_target = { x: 0, y: 0 };
-  let last_move = -Infinity;
-  const ripples: { x: number; y: number; start: number }[] = [];
-  let field_width = 1;
-  let field_height = 1;
+  let water: ReturnType<typeof create_water_surface> | undefined;
+  let drag: { id: number; x: number; y: number; moved: boolean } | undefined;
 
-  function pointer_position(event: PointerEvent) {
-    const bounds = canvas.getBoundingClientRect();
+  function pointer_position(event: PointerEvent, bounds = canvas.getBoundingClientRect()) {
     return {
       x: (event.clientX - bounds.left) / bounds.width,
       y: (event.clientY - bounds.top) / bounds.height,
@@ -216,38 +187,49 @@ export function mount_underwater(
   }
 
   function move_pointer(event: PointerEvent) {
-    if (motion.matches || event.pointerType === "touch") return;
-    const { x, y } = pointer_position(event);
-    if (pointer.strength < 0.01) {
-      pointer.x = x;
-      pointer.y = y;
+    if (motion.matches || !water) return;
+    const active_drag = drag?.id === event.pointerId ? drag : undefined;
+    if (!active_drag) return;
+
+    const now = performance.now();
+    const bounds = canvas.getBoundingClientRect();
+    const samples = event.getCoalescedEvents?.();
+    for (const sample of samples?.length ? samples : [event]) {
+      const { x, y } = pointer_position(sample, bounds);
+      if (water.stroke(active_drag.x, active_drag.y, x, y, now)) active_drag.moved = true;
+      active_drag.x = x;
+      active_drag.y = y;
     }
-    pointer_target.x = x;
-    pointer_target.y = y;
-    last_move = performance.now();
   }
 
-  function add_ripple(event: PointerEvent) {
-    if (motion.matches || event.button !== 0) return;
+  function start_pointer(event: PointerEvent) {
+    if (motion.matches || event.button !== 0 || drag) return;
     const { x, y } = pointer_position(event);
-    ripples.push({ x, y, start: performance.now() });
+    water?.begin_stroke();
+    drag = { id: event.pointerId, x, y, moved: false };
+  }
+
+  function end_pointer(event: PointerEvent) {
+    if (drag?.id !== event.pointerId) return;
+    if (event.type === "pointerup") {
+      move_pointer(event);
+      if (!drag.moved) water?.tap(drag.x, drag.y, performance.now());
+    }
+    reset_drag();
+  }
+
+  function reset_drag() {
+    drag = undefined;
   }
 
   function cleanup() {
+    if (signal.aborted) return;
+    lifecycle.abort();
     cancelAnimationFrame(frame);
     observer?.disconnect();
-    motion.removeEventListener("change", update_motion);
-    window.removeEventListener("pointermove", move_pointer);
-    window.removeEventListener("pointerdown", add_ripple);
-    canvas.removeEventListener("webglcontextlost", fallback);
     canvas.style.opacity = "0";
-    image.removeEventListener("load", upload_image);
-    image.removeEventListener("error", fallback);
     gl.deleteTexture(texture);
     gl.deleteTexture(ripple_texture);
-    gl.deleteFramebuffer(ripple_framebuffer);
-    gl.deleteProgram(ripple_program);
-    gl.deleteShader(ripple_fragment);
     gl.deleteBuffer(vertices);
     gl.deleteProgram(program);
     gl.deleteShader(vertex);
@@ -263,9 +245,8 @@ export function mount_underwater(
     cancelAnimationFrame(frame);
     if (!ready) return;
     if (motion.matches) {
-      pointer.strength = 0;
-      last_move = -Infinity;
-      ripples.length = 0;
+      reset_drag();
+      water?.reset();
       draw(0);
     } else {
       frame = requestAnimationFrame(animate);
@@ -275,25 +256,11 @@ export function mount_underwater(
   const start = performance.now();
 
   function animate(now: number) {
-    pointer.x += (pointer_target.x - pointer.x) * 0.2;
-    pointer.y += (pointer_target.y - pointer.y) * 0.2;
-    const strength = now - last_move < 70 ? 1 : 0;
-    pointer.strength += (strength - pointer.strength) * 0.12;
     draw((now - start) / 1000, now);
     frame = requestAnimationFrame(animate);
   }
 
-  if (
-    !vertex ||
-    !fragment ||
-    !program ||
-    !vertices ||
-    !texture ||
-    !ripple_fragment ||
-    !ripple_program ||
-    !ripple_texture ||
-    !ripple_framebuffer
-  ) {
+  if (!vertex || !fragment || !program || !vertices || !texture || !ripple_texture) {
     fallback();
     return undefined;
   }
@@ -302,14 +269,7 @@ export function mount_underwater(
   gl.attachShader(program, fragment);
   gl.bindAttribLocation(program, 0, "a_position");
   gl.linkProgram(program);
-  gl.attachShader(ripple_program, vertex);
-  gl.attachShader(ripple_program, ripple_fragment);
-  gl.bindAttribLocation(ripple_program, 0, "a_position");
-  gl.linkProgram(ripple_program);
-  if (
-    !gl.getProgramParameter(program, gl.LINK_STATUS) ||
-    !gl.getProgramParameter(ripple_program, gl.LINK_STATUS)
-  ) {
+  if (!gl.getProgramParameter(program, gl.LINK_STATUS)) {
     fallback();
     return undefined;
   }
@@ -325,62 +285,45 @@ export function mount_underwater(
   const image_size_uniform = gl.getUniformLocation(program, "u_image_size");
   const time_uniform = gl.getUniformLocation(program, "u_time");
 
-  const pointer_uniform = gl.getUniformLocation(program, "u_pointer");
-  const field_size_uniform = gl.getUniformLocation(ripple_program, "u_field_size");
-  const ripple_uniform = gl.getUniformLocation(ripple_program, "u_ripple");
+  const has_ripples_uniform = gl.getUniformLocation(program, "u_has_ripples");
   gl.uniform1i(gl.getUniformLocation(program, "u_ripple_field"), 1);
 
-  gl.activeTexture(gl.TEXTURE1);
-  gl.bindTexture(gl.TEXTURE_2D, ripple_texture);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.activeTexture(gl.TEXTURE0);
+  function configure_texture(unit: number, target: WebGLTexture) {
+    gl.activeTexture(unit);
+    gl.bindTexture(gl.TEXTURE_2D, target);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  }
+
+  configure_texture(gl.TEXTURE1, ripple_texture);
+  configure_texture(gl.TEXTURE0, texture);
 
   function draw(time: number, now = performance.now()) {
-    while (ripples[0] && now - ripples[0].start >= ripple_duration * 1000) ripples.shift();
-
-    gl.bindFramebuffer(gl.FRAMEBUFFER, ripple_framebuffer);
-    gl.viewport(0, 0, field_width, field_height);
-    gl.clearColor(0, 0, 0, 0);
-    gl.clear(gl.COLOR_BUFFER_BIT);
-    if (ripples.length) {
-      gl.useProgram(ripple_program);
-      gl.uniform2f(field_size_uniform, field_width, field_height);
-      gl.enable(gl.BLEND);
-      gl.blendFunc(gl.ONE, gl.ONE);
-      gl.enable(gl.SCISSOR_TEST);
-      for (const ripple of ripples) {
-        const age = Math.max(0, (now - ripple.start) / 1000);
-        const x = ripple.x * field_width;
-        const y = (1 - ripple.y) * field_height;
-        const radius = (age * 0.36 + 0.065) * field_height;
-        const left = Math.floor(x - radius);
-        const bottom = Math.floor(y - radius);
-        gl.scissor(left, bottom, Math.ceil(x + radius) - left, Math.ceil(y + radius) - bottom);
-        gl.uniform3f(ripple_uniform, x / field_height, ripple.y, age);
-        gl.drawArrays(gl.TRIANGLES, 0, 3);
-      }
-      gl.disable(gl.SCISSOR_TEST);
-      gl.disable(gl.BLEND);
+    const has_ripples = water?.update(now) ?? false;
+    if (water && has_ripples) {
+      gl.activeTexture(gl.TEXTURE1);
+      gl.texSubImage2D(
+        gl.TEXTURE_2D,
+        0,
+        0,
+        0,
+        water.width,
+        water.height,
+        gl.RGBA,
+        gl.UNSIGNED_BYTE,
+        water.pixels,
+      );
+      gl.activeTexture(gl.TEXTURE0);
     }
 
-    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
-    gl.viewport(0, 0, canvas.width, canvas.height);
-    gl.useProgram(program);
-    gl.uniform2f(viewport_uniform, canvas.width, canvas.height);
-    gl.uniform3f(pointer_uniform, pointer.x, pointer.y, pointer.strength);
+    gl.uniform1i(has_ripples_uniform, Number(has_ripples));
     gl.uniform1f(time_uniform, time);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
   function upload_image() {
-    gl.bindTexture(gl.TEXTURE_2D, texture);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
-    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
     gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGB, gl.RGB, gl.UNSIGNED_BYTE, image);
     if (gl.getError() !== gl.NO_ERROR) {
       fallback();
@@ -388,58 +331,55 @@ export function mount_underwater(
     }
 
     gl.uniform2f(image_size_uniform, image.naturalWidth, image.naturalHeight);
-    observer = new ResizeObserver(() => {
-      const scale = Math.min(devicePixelRatio, 1.5);
-      canvas.width = Math.max(1, Math.round(canvas.clientWidth * scale));
-      canvas.height = Math.max(1, Math.round(canvas.clientHeight * scale));
-      field_width = Math.max(1, Math.round(canvas.width / 2));
-      field_height = Math.max(1, Math.round(canvas.height / 2));
-      gl.activeTexture(gl.TEXTURE1);
-      gl.texImage2D(
-        gl.TEXTURE_2D,
-        0,
-        gl.RGBA,
-        field_width,
-        field_height,
-        0,
-        gl.RGBA,
-        gl.UNSIGNED_BYTE,
-        null,
-      );
-      gl.activeTexture(gl.TEXTURE0);
-      gl.bindFramebuffer(gl.FRAMEBUFFER, ripple_framebuffer);
-      gl.framebufferTexture2D(
-        gl.FRAMEBUFFER,
-        gl.COLOR_ATTACHMENT0,
-        gl.TEXTURE_2D,
-        ripple_texture,
-        0,
-      );
-      if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) {
-        fallback();
-        return;
-      }
-      draw(motion.matches ? 0 : (performance.now() - start) / 1000);
-      canvas.style.opacity = "1";
-      if (!ready) {
-        ready = true;
-        on_status("ready");
-        update_motion();
-      }
-    });
+    observer = new ResizeObserver(resize);
     observer.observe(canvas);
-    motion.addEventListener("change", update_motion);
-    window.addEventListener("pointermove", move_pointer, { passive: true });
-    window.addEventListener("pointerdown", add_ripple, { passive: true });
+    motion.addEventListener("change", update_motion, { signal });
+    window.addEventListener("pointermove", move_pointer, { passive: true, signal });
+    window.addEventListener("pointerdown", start_pointer, { passive: true, signal });
+    window.addEventListener("pointerup", end_pointer, { signal });
+    window.addEventListener("pointercancel", end_pointer, { signal });
+    window.addEventListener("blur", reset_drag, { signal });
   }
 
-  canvas.addEventListener("webglcontextlost", fallback);
+  function resize() {
+    const scale = Math.min(devicePixelRatio, 1.5);
+    const width = Math.max(1, Math.round(canvas.clientWidth * scale));
+    const height = Math.max(1, Math.round(canvas.clientHeight * scale));
+    if (ready && canvas.width === width && canvas.height === height) return;
+    canvas.width = width;
+    canvas.height = height;
+    water = create_water_surface(width, height);
+    gl.activeTexture(gl.TEXTURE1);
+    gl.texImage2D(
+      gl.TEXTURE_2D,
+      0,
+      gl.RGBA,
+      water.width,
+      water.height,
+      0,
+      gl.RGBA,
+      gl.UNSIGNED_BYTE,
+      water.pixels,
+    );
+    gl.activeTexture(gl.TEXTURE0);
+    gl.viewport(0, 0, width, height);
+    gl.uniform2f(viewport_uniform, width, height);
+    draw(motion.matches ? 0 : (performance.now() - start) / 1000);
+    canvas.style.opacity = "1";
+    if (!ready) {
+      ready = true;
+      on_status("ready");
+      if (!motion.matches) frame = requestAnimationFrame(animate);
+    }
+  }
+
+  canvas.addEventListener("webglcontextlost", fallback, { signal });
   if (image.complete) {
     if (image.naturalWidth) upload_image();
     else fallback();
   } else {
-    image.addEventListener("load", upload_image, { once: true });
-    image.addEventListener("error", fallback, { once: true });
+    image.addEventListener("load", upload_image, { once: true, signal });
+    image.addEventListener("error", fallback, { once: true, signal });
   }
   return cleanup;
 }
