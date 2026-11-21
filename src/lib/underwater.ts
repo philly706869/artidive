@@ -19,50 +19,17 @@ uniform sampler2D u_image;
 uniform vec2 u_resolution;
 uniform vec2 u_image_size;
 uniform float u_time;
-uniform sampler2D u_ripple_field;
-uniform bool u_has_ripples;
+uniform sampler2D u_surface;
+uniform float u_swell_strength;
 
-float random_value(vec2 cell) {
-  vec3 p = fract(cell.xyx * 0.1031);
-  p += dot(p, p.yzx + 19.19);
-  return fract((p.x + p.y) * p.z);
-}
-
-float noise(vec2 p) {
-  vec2 cell = floor(p);
-  vec2 f = fract(p);
-  vec2 blend = f * f * (3.0 - 2.0 * f);
-  return mix(
-    mix(random_value(cell), random_value(cell + vec2(1.0, 0.0)), blend.x),
-    mix(random_value(cell + vec2(0.0, 1.0)), random_value(cell + vec2(1.0, 1.0)), blend.x),
-    blend.y
-  );
-}
-
-float surface_edge(vec2 point, float time) {
-  vec2 cell = floor(point - 0.5);
-  vec2 local = point - cell;
-  // An entering or leaving cell is at least 1.57 units away.
-  // Cap the search radius below that so the sampling window leaves no seams.
-  float nearest = 2.40;
-  float next = 2.40;
-
-  for (int y = -1; y <= 2; y++) {
-    for (int x = -1; x <= 2; x++) {
-      vec2 neighbor = vec2(float(x), float(y));
-      vec2 id = cell + neighbor;
-      vec2 seed = vec2(random_value(id + 8.7), random_value(id + 31.4));
-      vec2 center = 0.5 + (seed - 0.5) * 0.62;
-      center += 0.12 * sin(time * vec2(0.48, 0.61) + seed * 6.283);
-      vec2 offset = neighbor + center - local;
-      float distance_squared = dot(offset, offset);
-      next = min(next, max(nearest, distance_squared));
-      nearest = min(nearest, distance_squared);
-    }
-  }
-
-  // The difference stays continuous when the runner-up changes.
-  return (next - nearest) * 0.5;
+vec2 swell_slope(vec2 p) {
+  float drift = sin(dot(p, vec2(2.2, -1.8)) + u_time * 0.36);
+  float first = cos(dot(p, vec2(4.1, 9.2)) - u_time * 1.05 + drift * 1.35);
+  float second = cos(dot(p, vec2(-8.4, 6.1)) + u_time * 0.78);
+  float third = cos(dot(p, vec2(11.0, 3.7)) - u_time * 1.28 + second * 0.8);
+  return vec2(0.41, 0.91) * first * 0.57
+    + vec2(-0.81, 0.59) * second * 0.31
+    + vec2(0.95, 0.32) * third * 0.20;
 }
 
 float bubbles(vec2 uv, float aspect) {
@@ -91,24 +58,11 @@ void main() {
   float screen_aspect = u_resolution.x / u_resolution.y;
   float image_aspect = u_image_size.x / u_image_size.y;
   vec2 cover = min(vec2(screen_aspect / image_aspect, image_aspect / screen_aspect), 1.0);
-  vec2 position = (uv - 0.5) * vec2(screen_aspect, 1.0);
-
-  vec2 flow = position * vec2(3.1, 5.6);
-  vec2 warp = vec2(
-    noise(flow + vec2(u_time * 0.13, 1.7)),
-    noise(flow + vec2(7.2, -u_time * 0.17))
-  ) - 0.5;
+  vec3 water = texture2D(u_surface, uv).rgb - vec3(128.0 / 255.0);
+  vec2 disturbance = water.xy * 0.058;
   vec2 aspect = vec2(screen_aspect, 1.0);
-  vec2 disturbance = vec2(0.0);
-  float ripple_light = 0.0;
-  if (u_has_ripples) {
-    vec2 slope = texture2D(u_ripple_field, uv).rg - vec2(128.0 / 255.0);
-    vec2 ripple_offset = slope * 0.058;
-    disturbance = ripple_offset;
-    ripple_light = length(ripple_offset) * 5.1;
-  }
-
-  vec2 displacement = warp * 0.019 + disturbance / aspect;
+  vec2 swell = swell_slope((uv - 0.5) * aspect);
+  vec2 displacement = (disturbance + swell * (0.014 * u_swell_strength)) / aspect;
   vec3 image = texture2D(u_image, (uv - 0.5 + displacement) * cover + 0.5).rgb;
 
   float depth = smoothstep(0.0, 1.0, uv.y);
@@ -116,25 +70,12 @@ void main() {
   vec3 blue = mix(vec3(0.095, 0.26, 0.58), vec3(0.31, 0.65, 0.95), luminance);
   vec3 color = mix(image, blue, 0.70 + depth * 0.13);
 
-  // Stretch the cells into broad, curved pools with shared reflective edges.
-  float surface = 1.0 - smoothstep(0.0, 0.40, uv.y);
-  float compressed_depth = uv.y + 0.36 * (1.0 - exp(-5.0 * uv.y));
-  vec2 water_position = vec2(position.x * 2.65, compressed_depth * 5.0);
-  water_position += warp * vec2(0.9, 1.35) + disturbance * vec2(2.65, 5.0);
-  water_position.y += sin(position.x * 7.2 - u_time * 0.52 + uv.y * 5.0) * 0.27;
-  water_position += vec2(u_time * 0.095, -u_time * 0.12);
-
-  float edge = surface_edge(water_position, u_time);
-  float edge_width = mix(0.07, 0.21, noise(water_position * 0.74 + 5.0));
-  float rim = 1.0 - smoothstep(0.024, edge_width, edge);
-  float glint = (1.0 - smoothstep(0.012, edge_width * 0.54, edge))
-    * smoothstep(0.48, 0.74, noise(water_position * 0.92 + 16.0));
-  float pool = smoothstep(0.03, 0.22, edge) * (noise(water_position * 0.65 + 9.3) - 0.5);
-  color += vec3(0.07, 0.19, 0.29) * pool * (0.65 + 0.75 * surface);
-  color = mix(color, vec3(0.39, 0.72, 1.0), rim * (0.19 + 0.46 * surface));
-  color = mix(color, vec3(0.94, 0.99, 1.0), glint * (0.13 + 0.76 * surface));
+  float swell_light = smoothstep(0.05, 0.67, dot(swell, vec2(0.52, -0.85)));
+  float surface_light = mix(0.055, 0.17, 1.0 - depth);
+  color = mix(color, vec3(0.63, 0.84, 1.0), swell_light * surface_light * u_swell_strength);
   color = mix(color, vec3(0.89, 0.98, 1.0), bubbles(uv, screen_aspect));
-  color = mix(color, vec3(0.73, 0.92, 1.0), min(0.35, ripple_light));
+  float crest_light = smoothstep(0.16, 0.45, abs(water.z)) * length(disturbance);
+  color = mix(color, vec3(0.73, 0.92, 1.0), min(0.16, crest_light * 4.0));
   gl_FragColor = vec4(color, 1.0);
 }
 `;
@@ -166,7 +107,7 @@ export function mount_underwater(
   const vertex = compile_shader(gl, gl.VERTEX_SHADER, vertex_source);
   const fragment = compile_shader(gl, gl.FRAGMENT_SHADER, fragment_source);
   const program = gl.createProgram();
-  const ripple_texture = gl.createTexture();
+  const surface_texture = gl.createTexture();
   const vertices = gl.createBuffer();
   const texture = gl.createTexture();
   const lifecycle = new AbortController();
@@ -229,7 +170,7 @@ export function mount_underwater(
     observer?.disconnect();
     canvas.style.opacity = "0";
     gl.deleteTexture(texture);
-    gl.deleteTexture(ripple_texture);
+    gl.deleteTexture(surface_texture);
     gl.deleteBuffer(vertices);
     gl.deleteProgram(program);
     gl.deleteShader(vertex);
@@ -247,7 +188,7 @@ export function mount_underwater(
     if (motion.matches) {
       reset_drag();
       water?.reset();
-      draw(0);
+      draw(0, performance.now(), true);
     } else {
       frame = requestAnimationFrame(animate);
     }
@@ -260,7 +201,7 @@ export function mount_underwater(
     frame = requestAnimationFrame(animate);
   }
 
-  if (!vertex || !fragment || !program || !vertices || !texture || !ripple_texture) {
+  if (!vertex || !fragment || !program || !vertices || !texture || !surface_texture) {
     fallback();
     return undefined;
   }
@@ -284,9 +225,9 @@ export function mount_underwater(
   const viewport_uniform = gl.getUniformLocation(program, "u_resolution");
   const image_size_uniform = gl.getUniformLocation(program, "u_image_size");
   const time_uniform = gl.getUniformLocation(program, "u_time");
+  const swell_uniform = gl.getUniformLocation(program, "u_swell_strength");
 
-  const has_ripples_uniform = gl.getUniformLocation(program, "u_has_ripples");
-  gl.uniform1i(gl.getUniformLocation(program, "u_ripple_field"), 1);
+  gl.uniform1i(gl.getUniformLocation(program, "u_surface"), 1);
 
   function configure_texture(unit: number, target: WebGLTexture) {
     gl.activeTexture(unit);
@@ -297,12 +238,11 @@ export function mount_underwater(
     gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
   }
 
-  configure_texture(gl.TEXTURE1, ripple_texture);
+  configure_texture(gl.TEXTURE1, surface_texture);
   configure_texture(gl.TEXTURE0, texture);
 
-  function draw(time: number, now = performance.now()) {
-    const has_ripples = water?.update(now) ?? false;
-    if (water && has_ripples) {
+  function draw(time: number, now = performance.now(), redraw_surface = false) {
+    if (water && (redraw_surface || (!motion.matches && water.update(now)))) {
       gl.activeTexture(gl.TEXTURE1);
       gl.texSubImage2D(
         gl.TEXTURE_2D,
@@ -318,7 +258,7 @@ export function mount_underwater(
       gl.activeTexture(gl.TEXTURE0);
     }
 
-    gl.uniform1i(has_ripples_uniform, Number(has_ripples));
+    gl.uniform1f(swell_uniform, motion.matches ? 0 : 1);
     gl.uniform1f(time_uniform, time);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }

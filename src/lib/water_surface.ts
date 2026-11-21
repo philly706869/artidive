@@ -1,5 +1,7 @@
 const grid_size = 160;
 const step_ms = 1000 / 60;
+const wave_speed = 0.24;
+const surface_damping = 0.963;
 const settle_ms = 2200;
 const stroke_spacing = 0.9;
 
@@ -12,15 +14,15 @@ export function create_water_surface(view_width: number, view_height: number) {
   let previous = new Float32Array(size);
   const damping = new Float32Array(size);
   const pixels = new Uint8ClampedArray(size * 4).fill(128);
-  let active_until = -Infinity;
-  let last_frame = 0;
+  let last_frame: number | undefined;
+  let active_until: number | undefined;
   let pending_ms = 0;
   let distance_to_sample = stroke_spacing * 0.5;
 
   for (let y = 1; y < height - 1; y++) {
     for (let x = 1; x < width - 1; x++) {
       const edge = Math.min(x, y, width - 1 - x, height - 1 - y);
-      damping[y * width + x] = 0.963 - 0.16 * Math.max(0, 1 - edge / 7);
+      damping[y * width + x] = surface_damping - 0.16 * Math.max(0, 1 - edge / 7);
     }
   }
 
@@ -31,9 +33,11 @@ export function create_water_surface(view_width: number, view_height: number) {
   function reset() {
     current.fill(0);
     previous.fill(0);
-    active_until = -Infinity;
+    active_until = undefined;
+    last_frame = undefined;
     pending_ms = 0;
     begin_stroke();
+    pixels.fill(128);
   }
 
   function disturb(x: number, y: number, amount: number) {
@@ -87,14 +91,17 @@ export function create_water_surface(view_width: number, view_height: number) {
   }
 
   function update(now: number) {
-    const elapsed = Math.min(now - last_frame, step_ms * 3);
+    const elapsed = Math.min(now - (last_frame ?? now), step_ms * 3);
     last_frame = now;
+    if (active_until === undefined) return false;
     if (now >= active_until) {
-      if (active_until !== -Infinity) reset();
-      return false;
+      reset();
+      return true;
     }
 
     pending_ms += Math.max(0, elapsed);
+    if (pending_ms < step_ms) return false;
+
     while (pending_ms >= step_ms) {
       for (let y = 1; y < height - 1; y++) {
         for (let x = 1; x < width - 1; x++) {
@@ -106,22 +113,31 @@ export function create_water_surface(view_width: number, view_height: number) {
             current[index + 1]! +
             current[index - width]! +
             current[index + width]!;
-          // Advance a damped 2D wave equation with fixed time steps.
-          previous[index] = level + (velocity + 0.24 * (neighbors - 4 * level)) * damping[index]!;
+          previous[index] =
+            level + velocity * damping[index]! + wave_speed * (neighbors - 4 * level);
         }
       }
       [current, previous] = [previous, current];
       pending_ms -= step_ms;
     }
 
+    encode_surface();
+    return true;
+  }
+
+  function encode_surface() {
     for (let y = 1; y < height - 1; y++) {
       for (let x = 1; x < width - 1; x++) {
         const index = y * width + x;
-        pixels[index * 4] = 128 + (current[index + 1]! - current[index - 1]!) * 160;
-        pixels[index * 4 + 1] = 128 + (current[index + width]! - current[index - width]!) * 160;
+        const left = current[index - 1]!;
+        const right = current[index + 1]!;
+        const top = current[index - width]!;
+        const bottom = current[index + width]!;
+        pixels[index * 4] = 128 + (right - left) * 160;
+        pixels[index * 4 + 1] = 128 + (bottom - top) * 160;
+        pixels[index * 4 + 2] = 128 + (left + right + top + bottom - 4 * current[index]!) * 520;
       }
     }
-    return true;
   }
 
   return { width, height, pixels, reset, tap, begin_stroke, stroke, update };
