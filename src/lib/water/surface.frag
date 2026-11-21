@@ -45,15 +45,6 @@ vec2 swell_slope(vec2 p) {
     + vec2(0.95, 0.32) * third * 0.20;
 }
 
-vec2 ocean_slope(vec2 p) {
-  vec2 primary = normalize(vec2(0.26, 1.0));
-  vec2 secondary = normalize(vec2(-0.64, 0.77));
-  float crest = dot(p, primary) * 5.2 - u_time * 1.35;
-  float cross_wave = dot(p, secondary) * 7.4 - u_time * 0.94;
-  return primary * (cos(crest) + 0.18 * cos(2.0 * crest)) * 0.28
-    + secondary * cos(cross_wave) * 0.11;
-}
-
 void main() {
   vec2 screen = gl_FragCoord.xy / u_resolution;
   vec2 uv = vec2(screen.x, 1.0 - screen.y);
@@ -62,9 +53,8 @@ void main() {
   vec2 cover = min(vec2(screen_aspect / image_aspect, image_aspect / screen_aspect), 1.0);
   vec4 water = sample_surface(uv) - vec4(128.0 / 255.0);
   vec2 aspect = vec2(screen_aspect, 1.0);
-  vec2 surface_position = (uv - 0.5) * aspect;
-  vec2 slope = ocean_slope(surface_position)
-    + swell_slope(surface_position) * 0.13 + water.xy * 2.6;
+  vec2 swell = swell_slope((uv - 0.5) * aspect);
+  vec2 slope = swell * 0.16 + water.xy * 2.6;
   vec2 offset = slope * 0.025 / aspect;
   vec3 image = texture2D(u_image, (uv - 0.5 + offset) * cover + 0.5).rgb;
   float depth = smoothstep(0.0, 1.0, uv.y);
