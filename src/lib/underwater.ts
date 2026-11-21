@@ -19,7 +19,6 @@ uniform sampler2D u_image;
 uniform vec2 u_resolution;
 uniform vec2 u_image_size;
 uniform float u_time;
-uniform vec3 u_pointer;
 uniform sampler2D u_ripple_field;
 uniform bool u_has_ripples;
 
@@ -100,16 +99,12 @@ void main() {
     noise(flow + vec2(7.2, -u_time * 0.17))
   ) - 0.5;
   vec2 aspect = vec2(screen_aspect, 1.0);
-  vec2 pointer_offset = (uv - u_pointer.xy) * aspect;
-  float pointer_distance = length(pointer_offset);
-  float wake = u_pointer.z * (1.0 - smoothstep(0.0, 0.19, pointer_distance));
-  vec2 disturbance = pointer_offset * wake
-    * sin(pointer_distance * 54.0 - u_time * 6.0) * 0.18;
+  vec2 disturbance = vec2(0.0);
   float ripple_light = 0.0;
   if (u_has_ripples) {
     vec2 slope = texture2D(u_ripple_field, uv).rg - vec2(128.0 / 255.0);
     vec2 ripple_offset = slope * 0.058;
-    disturbance += ripple_offset;
+    disturbance = ripple_offset;
     ripple_light = length(ripple_offset) * 5.1;
   }
 
@@ -179,9 +174,6 @@ export function mount_underwater(
   let frame = 0;
   let ready = false;
 
-  const pointer = { x: 0, y: 0, strength: 0 };
-  const pointer_target = { x: 0, y: 0 };
-  let last_move = -Infinity;
   let water: ReturnType<typeof create_water_surface> | undefined;
   let drag: { id: number; x: number; y: number; moved: boolean } | undefined;
 
@@ -193,33 +185,19 @@ export function mount_underwater(
   }
 
   function move_pointer(event: PointerEvent) {
-    if (motion.matches) return;
+    if (motion.matches || !water) return;
     const active_drag = drag?.id === event.pointerId ? drag : undefined;
-    if (!active_drag && event.pointerType === "touch") return;
+    if (!active_drag) return;
 
     const now = performance.now();
-    if (active_drag) {
-      const bounds = canvas.getBoundingClientRect();
-      const samples = event.getCoalescedEvents?.();
-      for (const sample of samples?.length ? samples : [event]) {
-        const { x, y } = pointer_position(sample, bounds);
-        if (water?.stroke(active_drag.x, active_drag.y, x, y, now)) active_drag.moved = true;
-        active_drag.x = x;
-        active_drag.y = y;
-      }
-      last_move = -Infinity;
-      pointer.strength = 0;
-      return;
+    const bounds = canvas.getBoundingClientRect();
+    const samples = event.getCoalescedEvents?.();
+    for (const sample of samples?.length ? samples : [event]) {
+      const { x, y } = pointer_position(sample, bounds);
+      if (water.stroke(active_drag.x, active_drag.y, x, y, now)) active_drag.moved = true;
+      active_drag.x = x;
+      active_drag.y = y;
     }
-
-    const { x, y } = pointer_position(event);
-    if (pointer.strength < 0.01) {
-      pointer.x = x;
-      pointer.y = y;
-    }
-    pointer_target.x = x;
-    pointer_target.y = y;
-    last_move = now;
   }
 
   function start_pointer(event: PointerEvent) {
@@ -273,8 +251,6 @@ export function mount_underwater(
     if (!ready) return;
     if (motion.matches) {
       reset_drag();
-      pointer.strength = 0;
-      last_move = -Infinity;
       water?.reset();
       draw(0);
     } else {
@@ -285,10 +261,6 @@ export function mount_underwater(
   const start = performance.now();
 
   function animate(now: number) {
-    pointer.x += (pointer_target.x - pointer.x) * 0.2;
-    pointer.y += (pointer_target.y - pointer.y) * 0.2;
-    const strength = now - last_move < 70 ? 1 : 0;
-    pointer.strength += (strength - pointer.strength) * 0.12;
     draw((now - start) / 1000, now);
     frame = requestAnimationFrame(animate);
   }
@@ -318,7 +290,6 @@ export function mount_underwater(
   const image_size_uniform = gl.getUniformLocation(program, "u_image_size");
   const time_uniform = gl.getUniformLocation(program, "u_time");
 
-  const pointer_uniform = gl.getUniformLocation(program, "u_pointer");
   const has_ripples_uniform = gl.getUniformLocation(program, "u_has_ripples");
   gl.uniform1i(gl.getUniformLocation(program, "u_ripple_field"), 1);
 
@@ -349,7 +320,6 @@ export function mount_underwater(
     }
 
     gl.uniform1i(has_ripples_uniform, Number(has_ripples));
-    gl.uniform3f(pointer_uniform, pointer.x, pointer.y, pointer.strength);
     gl.uniform1f(time_uniform, time);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
