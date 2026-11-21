@@ -53,6 +53,7 @@
 
   canvas {
     opacity: 0;
+    touch-action: none;
   }
 
   .shimmer {
