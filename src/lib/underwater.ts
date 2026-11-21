@@ -20,7 +20,6 @@ uniform vec2 u_resolution;
 uniform vec2 u_image_size;
 uniform float u_time;
 uniform sampler2D u_surface;
-uniform float u_swell_strength;
 
 vec2 swell_slope(vec2 p) {
   float drift = sin(dot(p, vec2(2.2, -1.8)) + u_time * 0.36);
@@ -62,7 +61,7 @@ void main() {
   vec2 disturbance = water.xy * 0.058;
   vec2 aspect = vec2(screen_aspect, 1.0);
   vec2 swell = swell_slope((uv - 0.5) * aspect);
-  vec2 displacement = (disturbance + swell * (0.014 * u_swell_strength)) / aspect;
+  vec2 displacement = (disturbance + swell * 0.014) / aspect;
   vec3 image = texture2D(u_image, (uv - 0.5 + displacement) * cover + 0.5).rgb;
 
   float depth = smoothstep(0.0, 1.0, uv.y);
@@ -72,7 +71,7 @@ void main() {
 
   float swell_light = smoothstep(0.05, 0.67, dot(swell, vec2(0.52, -0.85)));
   float surface_light = mix(0.055, 0.17, 1.0 - depth);
-  color = mix(color, vec3(0.63, 0.84, 1.0), swell_light * surface_light * u_swell_strength);
+  color = mix(color, vec3(0.63, 0.84, 1.0), swell_light * surface_light);
   color = mix(color, vec3(0.89, 0.98, 1.0), bubbles(uv, screen_aspect));
   float crest_light = smoothstep(0.16, 0.45, abs(water.z)) * length(disturbance);
   color = mix(color, vec3(0.73, 0.92, 1.0), min(0.16, crest_light * 4.0));
@@ -112,7 +111,6 @@ export function mount_underwater(
   const texture = gl.createTexture();
   const lifecycle = new AbortController();
   const { signal } = lifecycle;
-  const motion = matchMedia("(prefers-reduced-motion: reduce)");
   let observer: ResizeObserver | undefined;
   let frame = 0;
   let ready = false;
@@ -128,7 +126,7 @@ export function mount_underwater(
   }
 
   function move_pointer(event: PointerEvent) {
-    if (motion.matches || !water) return;
+    if (!water) return;
     const active_drag = drag?.id === event.pointerId ? drag : undefined;
     if (!active_drag) return;
 
@@ -144,7 +142,7 @@ export function mount_underwater(
   }
 
   function start_pointer(event: PointerEvent) {
-    if (motion.matches || event.button !== 0 || drag) return;
+    if (event.button !== 0 || drag) return;
     const { x, y } = pointer_position(event);
     water?.begin_stroke();
     drag = { id: event.pointerId, x, y, moved: false };
@@ -182,22 +180,10 @@ export function mount_underwater(
     on_status("fallback");
   }
 
-  function update_motion() {
-    cancelAnimationFrame(frame);
-    if (!ready) return;
-    if (motion.matches) {
-      reset_drag();
-      water?.reset();
-      draw(0, performance.now(), true);
-    } else {
-      frame = requestAnimationFrame(animate);
-    }
-  }
-
   const start = performance.now();
 
   function animate(now: number) {
-    draw((now - start) / 1000, now);
+    draw(now);
     frame = requestAnimationFrame(animate);
   }
 
@@ -225,7 +211,6 @@ export function mount_underwater(
   const viewport_uniform = gl.getUniformLocation(program, "u_resolution");
   const image_size_uniform = gl.getUniformLocation(program, "u_image_size");
   const time_uniform = gl.getUniformLocation(program, "u_time");
-  const swell_uniform = gl.getUniformLocation(program, "u_swell_strength");
 
   gl.uniform1i(gl.getUniformLocation(program, "u_surface"), 1);
 
@@ -241,8 +226,8 @@ export function mount_underwater(
   configure_texture(gl.TEXTURE1, surface_texture);
   configure_texture(gl.TEXTURE0, texture);
 
-  function draw(time: number, now = performance.now(), redraw_surface = false) {
-    if (water && (redraw_surface || (!motion.matches && water.update(now)))) {
+  function draw(now: number) {
+    if (water?.update(now)) {
       gl.activeTexture(gl.TEXTURE1);
       gl.texSubImage2D(
         gl.TEXTURE_2D,
@@ -258,8 +243,7 @@ export function mount_underwater(
       gl.activeTexture(gl.TEXTURE0);
     }
 
-    gl.uniform1f(swell_uniform, motion.matches ? 0 : 1);
-    gl.uniform1f(time_uniform, time);
+    gl.uniform1f(time_uniform, (now - start) / 1000);
     gl.drawArrays(gl.TRIANGLES, 0, 3);
   }
 
@@ -273,7 +257,6 @@ export function mount_underwater(
     gl.uniform2f(image_size_uniform, image.naturalWidth, image.naturalHeight);
     observer = new ResizeObserver(resize);
     observer.observe(canvas);
-    motion.addEventListener("change", update_motion, { signal });
     window.addEventListener("pointermove", move_pointer, { passive: true, signal });
     window.addEventListener("pointerdown", start_pointer, { passive: true, signal });
     window.addEventListener("pointerup", end_pointer, { signal });
@@ -304,12 +287,12 @@ export function mount_underwater(
     gl.activeTexture(gl.TEXTURE0);
     gl.viewport(0, 0, width, height);
     gl.uniform2f(viewport_uniform, width, height);
-    draw(motion.matches ? 0 : (performance.now() - start) / 1000);
+    draw(performance.now());
     canvas.style.opacity = "1";
     if (!ready) {
       ready = true;
       on_status("ready");
-      if (!motion.matches) frame = requestAnimationFrame(animate);
+      frame = requestAnimationFrame(animate);
     }
   }
 

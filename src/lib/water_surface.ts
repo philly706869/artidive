@@ -140,5 +140,5 @@ export function create_water_surface(view_width: number, view_height: number) {
     }
   }
 
-  return { width, height, pixels, reset, tap, begin_stroke, stroke, update };
+  return { width, height, pixels, tap, begin_stroke, stroke, update };
 }
