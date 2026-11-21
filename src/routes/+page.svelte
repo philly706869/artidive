@@ -4,28 +4,80 @@
   import { onMount } from "svelte";
 
   let canvas: HTMLCanvasElement;
+  let image: HTMLImageElement;
+  let image_settled = $state(false);
+  let shader_status = $state<"loading" | "ready" | "fallback">("loading");
+  const loading = $derived(
+    shader_status !== "ready" && !(shader_status === "fallback" && image_settled),
+  );
 
-  onMount(() => mount_underwater(canvas, artist));
+  function settle_image() {
+    image_settled = true;
+  }
+
+  onMount(() => {
+    if (image.complete) settle_image();
+    return mount_underwater(canvas, image, (status) => {
+      shader_status = status;
+    });
+  });
 </script>
 
-<div class="background" style:--image="url({artist})">
+<div class="background" aria-hidden="true">
+  <img bind:this={image} src={artist} alt="" onload={settle_image} onerror={settle_image} />
   <canvas bind:this={canvas}></canvas>
+  {#if loading}
+    <div class="shimmer"></div>
+  {/if}
 </div>
 
 <style>
   .background {
     position: fixed;
     inset: 0;
-    background-image: var(--image);
     background-color: #073044;
-    background-position: center;
-    background-size: cover;
+  }
+
+  img,
+  canvas,
+  .shimmer {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+  }
+
+  img {
+    object-fit: cover;
   }
 
   canvas {
-    display: block;
-    width: 100%;
-    height: 100%;
     opacity: 0;
+  }
+
+  .shimmer {
+    overflow: hidden;
+    background: #e8e9eb;
+  }
+
+  @media (prefers-reduced-motion: no-preference) {
+    .shimmer::before {
+      position: absolute;
+      inset: 0 auto 0 0;
+      width: 38%;
+      content: "";
+      background: linear-gradient(90deg, transparent, rgb(255 255 255 / 75%), transparent);
+      animation: shimmer 1.05s ease-in-out infinite;
+    }
+  }
+
+  @keyframes shimmer {
+    from {
+      transform: translateX(calc(-100% - 15vh)) skewX(-12deg);
+    }
+
+    to {
+      transform: translateX(calc(100vw + 15vh)) skewX(-12deg);
+    }
   }
 </style>
